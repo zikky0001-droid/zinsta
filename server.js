@@ -1,6 +1,7 @@
 /**
  * Instagram Stalk API - Hosted on Render
- * Provides reliable Instagram user data with fallback APIs
+ * Uses Direct Instagram Web API as primary source
+ * Fallback: Vreden → NexRay
  */
 
 const express = require('express');
@@ -56,16 +57,112 @@ function formatTimestamp(timestamp) {
 }
 
 // ============================================
-// API 1: Vreden (Primary - Most Reliable)
+// API 1: Direct Instagram Web API (PRIMARY)
+// ============================================
+async function fetchDirectInstagram(username, retry = false) {
+    log(`🔍 Fetching from Instagram API: ${username}`);
+    try {
+        const response = await axios.get(
+            'https://www.instagram.com/api/v1/users/web_profile_info/',
+            {
+                params: { username },
+                headers: {
+                    'User-Agent': 'Mozilla/5.0',
+                    'X-IG-App-ID': '936619743392459',
+                    'Referer': 'https://www.instagram.com/',
+                    'Accept': '*/*'
+                },
+                timeout: 30000
+            }
+        );
+
+        if (!response.data?.data?.user) {
+            log(`❌ Instagram: User not found: ${username}`);
+            return null;
+        }
+
+        const user = response.data.data.user;
+        log(`✅ Instagram API success for: ${username}`);
+
+        // Extract posts with rich data
+        const posts = (user.edge_owner_to_timeline_media?.edges || []).map(({ node }) => ({
+            id: node.id,
+            shortcode: node.shortcode,
+            type: node.__typename,
+            isVideo: node.is_video || false,
+            caption: node.edge_media_to_caption?.edges?.[0]?.node?.text || '',
+            likes: node.edge_liked_by?.count ?? 0,
+            comments: node.edge_media_to_comment?.count ?? 0,
+            views: node.video_view_count ?? null,
+            thumbnail: node.display_url || node.thumbnail_src || '',
+            video: node.video_url || null,
+            takenAt: node.taken_at_timestamp,
+            timestampFormatted: formatTimestamp(node.taken_at_timestamp),
+            dimensions: node.dimensions || null,
+            accessibilityCaption: node.accessibility_caption || null,
+            location: node.location?.name || null,
+            productType: node.product_type || null
+        }));
+
+        return {
+            success: true,
+            source: 'instagram-web',
+            data: {
+                id: user.id,
+                username: user.username,
+                fullName: user.full_name || user.username,
+                biography: user.biography || '',
+                followers: user.edge_followed_by?.count ?? 0,
+                following: user.edge_follow?.count ?? 0,
+                posts: user.edge_owner_to_timeline_media?.count ?? 0,
+                highlights: user.highlight_reel_count || 0,
+                verified: user.is_verified || false,
+                private: user.is_private || false,
+                professional: user.is_professional_account || false,
+                business: user.is_business_account || false,
+                category: user.category_name || '',
+                pronouns: user.pronouns || [],
+                eimuId: user.eimu_id || null,
+                fbid: user.fbid || null,
+                hasClips: user.has_clips || false,
+                hasChannel: user.has_channel || false,
+                hasGuides: user.has_guides || false,
+                externalUrl: user.external_url || '',
+                profilePic: user.profile_pic_url_hd || user.profile_pic_url || '',
+                nextCursor: user.edge_owner_to_timeline_media?.page_info?.end_cursor || null,
+                postsData: posts.slice(0, 10)
+            }
+        };
+
+    } catch (error) {
+        // Rate limit - retry once
+        if (error.response?.status === 429 && !retry) {
+            log(`⏳ Rate limited (429), retrying once...`);
+            await new Promise(r => setTimeout(r, 1500));
+            return fetchDirectInstagram(username, true);
+        }
+        
+        if (error.response?.status === 404) {
+            log(`❌ Instagram: User not found (404): ${username}`);
+            return null;
+        }
+        
+        log(`❌ Instagram API error: ${error.message}`);
+        return null;
+    }
+}
+
+// ============================================
+// API 2: Vreden (Fallback)
 // ============================================
 async function fetchFromVreden(username) {
-    log(`🔍 Trying Vreden API for: ${username}`);
+    log(`🔍 Trying Vreden API: ${username}`);
     try {
         const response = await axios.get(
             `https://api.vreden.my.id/api/v1/stalker/instagram?username=${encodeURIComponent(username)}`,
             {
                 headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'User-Agent': 'Mozilla/5.0',
                     'Accept': 'application/json'
                 },
                 timeout: 15000
@@ -89,7 +186,7 @@ async function fetchFromVreden(username) {
                     views: null,
                     thumbnail: post.display_url || '',
                     video: null,
-                    timestamp: post.taken_at || Math.floor(Date.now() / 1000),
+                    takenAt: post.taken_at || Math.floor(Date.now() / 1000),
                     timestampFormatted: post.taken_at ? formatTimestamp(post.taken_at) : 'Unknown'
                 }));
             }
@@ -111,8 +208,15 @@ async function fetchFromVreden(username) {
                     professional: false,
                     business: false,
                     category: '',
+                    pronouns: [],
+                    eimuId: null,
+                    fbid: null,
+                    hasClips: false,
+                    hasChannel: false,
+                    hasGuides: false,
                     externalUrl: result.external_url || '',
                     profilePic: result.profile_pic_hd?.url || result.profile_pic || '',
+                    nextCursor: null,
                     postsData: postsData
                 }
             };
@@ -125,16 +229,16 @@ async function fetchFromVreden(username) {
 }
 
 // ============================================
-// API 2: NexRay (Secondary)
+// API 3: NexRay (Last Fallback)
 // ============================================
 async function fetchFromNexRay(username) {
-    log(`🔍 Trying NexRay API for: ${username}`);
+    log(`🔍 Trying NexRay API: ${username}`);
     try {
         const response = await axios.get(
             `https://api.nexray.web.id/stalker/instagram?username=${encodeURIComponent(username)}`,
             {
                 headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'User-Agent': 'Mozilla/5.0',
                     'Accept': 'application/json'
                 },
                 timeout: 15000
@@ -158,7 +262,7 @@ async function fetchFromNexRay(username) {
                     views: post.views || null,
                     thumbnail: post.thumbnail || post.display_url || '',
                     video: post.video_url || null,
-                    timestamp: post.taken_at || Math.floor(Date.now() / 1000),
+                    takenAt: post.taken_at || Math.floor(Date.now() / 1000),
                     timestampFormatted: post.taken_at ? formatTimestamp(post.taken_at) : 'Unknown'
                 }));
             }
@@ -180,8 +284,15 @@ async function fetchFromNexRay(username) {
                     professional: result.is_business_account || false,
                     business: result.is_business_account || false,
                     category: result.category_name || '',
+                    pronouns: [],
+                    eimuId: null,
+                    fbid: null,
+                    hasClips: false,
+                    hasChannel: false,
+                    hasGuides: false,
                     externalUrl: result.external_url || '',
                     profilePic: result.profile_pic_url || '',
+                    nextCursor: null,
                     postsData: postsData
                 }
             };
@@ -189,91 +300,6 @@ async function fetchFromNexRay(username) {
         return null;
     } catch (error) {
         log(`❌ NexRay API error: ${error.message}`);
-        return null;
-    }
-}
-
-// ============================================
-// API 3: Direct Instagram (Fallback)
-// ============================================
-async function fetchDirectInstagram(username) {
-    log(`🔍 Trying direct Instagram API for: ${username}`);
-    try {
-        const response = await axios.get(
-            'https://www.instagram.com/api/v1/users/web_profile_info/',
-            {
-                params: { username },
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    'X-IG-App-ID': '936619743392459',
-                    'Accept': 'application/json, text/plain, */*',
-                    'Accept-Language': 'en-US,en;q=0.9',
-                    'Accept-Encoding': 'gzip, deflate, br',
-                    'Referer': 'https://www.instagram.com/',
-                    'Origin': 'https://www.instagram.com',
-                    'Sec-Fetch-Dest': 'empty',
-                    'Sec-Fetch-Mode': 'cors',
-                    'Sec-Fetch-Site': 'same-site',
-                    'Connection': 'keep-alive'
-                },
-                timeout: 30000
-            }
-        );
-
-        if (!response.data?.data?.user) {
-            log(`❌ Direct Instagram: User not found: ${username}`);
-            return null;
-        }
-
-        const user = response.data.data.user;
-        log(`✅ Direct Instagram success for: ${username}`);
-        
-        const posts = user.edge_owner_to_timeline_media?.edges?.map(({ node }) => ({
-            id: node.id,
-            shortcode: node.shortcode,
-            type: node.__typename,
-            isVideo: node.is_video || false,
-            caption: node.edge_media_to_caption?.edges?.[0]?.node?.text || '',
-            likes: node.edge_liked_by?.count || 0,
-            comments: node.edge_media_to_comment?.count || 0,
-            views: node.video_view_count || null,
-            thumbnail: node.display_url,
-            video: node.video_url || null,
-            timestamp: node.taken_at_timestamp,
-            timestampFormatted: formatTimestamp(node.taken_at_timestamp)
-        })) || [];
-
-        return {
-            success: true,
-            source: 'direct',
-            data: {
-                id: user.id,
-                username: user.username,
-                fullName: user.full_name || user.username,
-                biography: user.biography || '',
-                followers: user.edge_followed_by?.count || 0,
-                following: user.edge_follow?.count || 0,
-                posts: user.edge_owner_to_timeline_media?.count || 0,
-                highlights: user.highlight_reel_count || 0,
-                verified: user.is_verified || false,
-                private: user.is_private || false,
-                professional: user.is_professional_account || false,
-                business: user.is_business_account || false,
-                category: user.category_name || '',
-                externalUrl: user.external_url || '',
-                profilePic: user.profile_pic_url_hd || user.profile_pic_url || '',
-                postsData: posts.slice(0, 5)
-            }
-        };
-
-    } catch (error) {
-        if (error.response?.status === 429) {
-            log(`❌ Direct Instagram: Rate limited (429)`);
-        } else if (error.response?.status === 404) {
-            log(`❌ Direct Instagram: User not found (404)`);
-        } else {
-            log(`❌ Direct Instagram error: ${error.message}`);
-        }
         return null;
     }
 }
@@ -296,11 +322,11 @@ async function stalkInstagram(username) {
 
     log(`🔍 Fetching Instagram user: ${username}`);
 
-    // Try APIs in order
+    // Try APIs in order: Instagram → Vreden → NexRay
     const apis = [
+        { fn: fetchDirectInstagram, name: 'Instagram' },
         { fn: fetchFromVreden, name: 'Vreden' },
-        { fn: fetchFromNexRay, name: 'NexRay' },
-        { fn: fetchDirectInstagram, name: 'Direct' }
+        { fn: fetchFromNexRay, name: 'NexRay' }
     ];
 
     for (const api of apis) {
@@ -322,63 +348,6 @@ async function stalkInstagram(username) {
         error: 'All APIs failed. Please try again later.'
     };
 }
-
-// ============================================
-// API ENDPOINTS
-// ============================================
-
-// Health check
-app.get('/', (req, res) => {
-    res.json({
-        status: 'ok',
-        message: 'Instagram Stalk API is running',
-        endpoints: [
-            '/stalk/:username',
-            '/stalk/:username?format=whatsapp'
-        ]
-    });
-});
-
-// Stalk endpoint
-app.get('/stalk/:username', async (req, res) => {
-    const { username } = req.params;
-    const { format } = req.query;
-    
-    if (!username) {
-        return res.status(400).json({
-            success: false,
-            error: 'Username is required'
-        });
-    }
-
-    log(`📥 Request for: ${username} (format: ${format || 'json'})`);
-
-    const result = await stalkInstagram(username);
-
-    if (!result.success) {
-        return res.status(404).json(result);
-    }
-
-    // Return raw data
-    if (format === 'raw' || format === 'json') {
-        return res.json(result);
-    }
-
-    // Return formatted WhatsApp message
-    if (format === 'whatsapp') {
-        const data = result.data;
-        const message = formatWhatsAppResponse(data);
-        return res.json({
-            success: true,
-            source: result.source,
-            cached: result.cached || false,
-            formatted: message
-        });
-    }
-
-    // Default: return full data
-    return res.json(result);
-});
 
 // ============================================
 // WHATSAPP FORMATTING
@@ -446,6 +415,57 @@ function formatWhatsAppResponse(data) {
 }
 
 // ============================================
+// API ENDPOINTS
+// ============================================
+
+// Health check
+app.get('/', (req, res) => {
+    res.json({
+        status: 'ok',
+        message: 'Instagram Stalk API is running',
+        endpoints: [
+            '/stalk/:username',
+            '/stalk/:username?format=whatsapp'
+        ]
+    });
+});
+
+// Stalk endpoint
+app.get('/stalk/:username', async (req, res) => {
+    const { username } = req.params;
+    const { format } = req.query;
+    
+    if (!username) {
+        return res.status(400).json({
+            success: false,
+            error: 'Username is required'
+        });
+    }
+
+    log(`📥 Request for: ${username} (format: ${format || 'json'})`);
+
+    const result = await stalkInstagram(username);
+
+    if (!result.success) {
+        return res.status(404).json(result);
+    }
+
+    // Return formatted WhatsApp message
+    if (format === 'whatsapp') {
+        const message = formatWhatsAppResponse(result.data);
+        return res.json({
+            success: true,
+            source: result.source,
+            cached: result.cached || false,
+            formatted: message
+        });
+    }
+
+    // Default: return full data
+    return res.json(result);
+});
+
+// ============================================
 // START SERVER
 // ============================================
 app.listen(PORT, () => {
@@ -464,5 +484,6 @@ process.on('SIGINT', () => {
     log('🛑 Received SIGINT, shutting down...');
     process.exit(0);
 });
+
 
 
