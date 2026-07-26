@@ -1,284 +1,468 @@
+/**
+ * Instagram Stalk API - Hosted on Render
+ * Provides reliable Instagram user data with fallback APIs
+ */
+
 const express = require('express');
-const { chromium } = require('playwright');
+const axios = require('axios');
+const cors = require('cors');
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
+// ============================================
+// MIDDLEWARE
+// ============================================
+app.use(cors());
 app.use(express.json());
-app.use(express.static('public'));
 
-// Main endpoint to get profile picture
-app.get('/api/dp/:username', async (req, res) => {
-    const { username } = req.params;
-    
-    if (!username) {
-        return res.status(400).json({ error: 'Username is required' });
-    }
+// ============================================
+// LOGGING (Minimal)
+// ============================================
+const log = (msg) => {
+    console.log(`[${new Date().toISOString()}] ${msg}`);
+};
 
-    let browser = null;
-    
+// ============================================
+// CACHE (In-memory, 24-hour expiry)
+// ============================================
+const cache = new Map();
+const CACHE_DURATION = 24 * 60 * 60 * 1000;
+
+// ============================================
+// FORMAT FUNCTIONS
+// ============================================
+function formatNumber(num) {
+    if (!num) return '0';
+    const number = parseInt(num);
+    if (isNaN(number)) return '0';
+    if (number >= 1000000000000) return (number / 1000000000000).toFixed(1) + 'T';
+    if (number >= 1000000000) return (number / 1000000000).toFixed(1) + 'B';
+    if (number >= 1000000) return (number / 1000000).toFixed(1) + 'M';
+    if (number >= 1000) return (number / 1000).toFixed(1) + 'K';
+    return number.toString();
+}
+
+function formatTimestamp(timestamp) {
+    const date = new Date(timestamp * 1000);
+    const now = new Date();
+    const diff = now - date;
+    if (diff < 60000) return 'Just now';
+    if (diff < 3600000) return Math.floor(diff / 60000) + 'm ago';
+    if (diff < 86400000) return Math.floor(diff / 3600000) + 'h ago';
+    if (diff < 604800000) return Math.floor(diff / 86400000) + 'd ago';
+    if (diff < 2592000000) return Math.floor(diff / 604800000) + 'w ago';
+    return date.toLocaleDateString();
+}
+
+// ============================================
+// API 1: Vreden (Primary - Most Reliable)
+// ============================================
+async function fetchFromVreden(username) {
+    log(`🔍 Trying Vreden API for: ${username}`);
     try {
-        console.log(`Fetching profile picture for: ${username}`);
-        
-        // Launch browser with render-compatible settings
-        browser = await chromium.launch({
-            headless: true,
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-accelerated-2d-canvas',
-                '--disable-gpu'
-            ]
-        });
-
-        const context = await browser.newContext({
-            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        });
-
-        const page = await context.newPage();
-        
-        // Navigate to indown.io
-        await page.goto('https://indown.io/insta-dp-viewer', {
-            waitUntil: 'networkidle',
-            timeout: 30000
-        });
-
-        // Wait for and fill the username input
-        await page.waitForSelector('input[type="text"], input[placeholder*="username"], input[name="username"]', {
-            timeout: 10000
-        });
-
-        // Find the input field and fill it
-        const inputSelector = 'input[type="text"], input[placeholder*="username"], input[name="username"]';
-        await page.fill(inputSelector, username);
-
-        // Find and click the submit button
-        const buttonSelectors = [
-            'button[type="submit"]',
-            'button:has-text("View")',
-            'button:has-text("Download")',
-            'button:has-text("Get")',
-            'button:has-text("Search")'
-        ];
-
-        let buttonClicked = false;
-        for (const selector of buttonSelectors) {
-            try {
-                await page.click(selector, { timeout: 5000 });
-                buttonClicked = true;
-                break;
-            } catch (e) {
-                // Continue to next selector
+        const response = await axios.get(
+            `https://api.vreden.my.id/api/v1/stalker/instagram?username=${encodeURIComponent(username)}`,
+            {
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'Accept': 'application/json'
+                },
+                timeout: 15000
             }
-        }
-
-        if (!buttonClicked) {
-            throw new Error('Could not find submit button');
-        }
-
-        // Wait for results to load
-        await page.waitForTimeout(3000);
-        await page.waitForSelector('img[src*="instagram"], img[src*="cdn"], .profile-pic img, .dp-image img', {
-            timeout: 15000
-        });
-
-        // Extract all images
-        const images = await page.evaluate(() => {
-            const imgs = document.querySelectorAll('img');
-            const imageUrls = [];
-            
-            imgs.forEach(img => {
-                const src = img.getAttribute('src');
-                if (src && 
-                    (src.includes('instagram') || 
-                     src.includes('cdn') || 
-                     src.includes('profile') ||
-                     src.includes('dp') ||
-                     src.includes('avatar') ||
-                     img.className.includes('profile') ||
-                     img.className.includes('dp') ||
-                     img.className.includes('avatar'))) {
-                    imageUrls.push({
-                        url: src,
-                        alt: img.getAttribute('alt') || 'Profile picture',
-                        width: img.width || 0,
-                        height: img.height || 0
-                    });
-                }
-            });
-            
-            return imageUrls;
-        });
-
-        // Also try to get the profile picture URL from the indown.io API
-        const pageContent = await page.content();
-        const imageMatches = pageContent.match(/https?:\/\/[^\s<>"']+\.(?:jpg|jpeg|png|gif|webp)[^\s<>"']*/gi);
-        
-        const allImages = [...new Set(imageMatches || [])];
-        
-        // Filter for Instagram-related images
-        const instagramImages = allImages.filter(url => 
-            url.includes('instagram') || 
-            url.includes('cdninstagram') ||
-            url.includes('fbcdn') ||
-            url.includes('scontent')
         );
-
-        const result = {
-            success: true,
-            username: username,
-            images: {
-                found: images.length > 0 ? images : instagramImages.map(url => ({ url })),
-                raw: instagramImages.slice(0, 10) // Limit to 10 images
-            },
-            profile_picture: instagramImages.length > 0 ? {
-                url: instagramImages[0],
-                source: 'indown.io'
-            } : null
-        };
-
-        // Try to find the main profile picture using common selectors
-        const mainPic = await page.evaluate(() => {
-            const selectors = [
-                '.profile-pic img',
-                '.dp-image img',
-                '.profile-image img',
-                '.avatar img',
-                'img[alt*="profile"]',
-                'img[alt*="avatar"]',
-                'img[alt*="dp"]',
-                'img[class*="profile"]',
-                'img[class*="dp"]',
-                'img[class*="avatar"]'
-            ];
+        
+        if (response.data?.status && response.data?.result) {
+            const result = response.data.result;
+            log(`✅ Vreden API success for: ${username}`);
             
-            for (const selector of selectors) {
-                const img = document.querySelector(selector);
-                if (img && img.src) {
-                    return img.src;
-                }
+            let postsData = [];
+            if (result.statistics?.media) {
+                postsData = result.statistics.media.slice(0, 5).map((post, i) => ({
+                    id: i,
+                    shortcode: post.code || 'unknown',
+                    type: 'Image',
+                    isVideo: false,
+                    caption: post.caption || '',
+                    likes: post.like_count || 0,
+                    comments: post.comment_count || 0,
+                    views: null,
+                    thumbnail: post.display_url || '',
+                    video: null,
+                    timestamp: post.taken_at || Math.floor(Date.now() / 1000),
+                    timestampFormatted: post.taken_at ? formatTimestamp(post.taken_at) : 'Unknown'
+                }));
             }
-            return null;
-        });
-
-        if (mainPic) {
-            result.profile_picture = {
-                url: mainPic,
-                source: 'direct_selector'
+            
+            return {
+                success: true,
+                source: 'vreden',
+                data: {
+                    id: result.id || username,
+                    username: username,
+                    fullName: result.full_name || username,
+                    biography: result.biography || '',
+                    followers: result.statistics?.follower || 0,
+                    following: result.statistics?.following || 0,
+                    posts: result.statistics?.post || 0,
+                    highlights: 0,
+                    verified: result.is_verified || false,
+                    private: result.is_private || false,
+                    professional: false,
+                    business: false,
+                    category: '',
+                    externalUrl: result.external_url || '',
+                    profilePic: result.profile_pic_hd?.url || result.profile_pic || '',
+                    postsData: postsData
+                }
             };
         }
+        return null;
+    } catch (error) {
+        log(`❌ Vreden API error: ${error.message}`);
+        return null;
+    }
+}
 
-        console.log(`Successfully fetched data for ${username}`);
-        res.json(result);
+// ============================================
+// API 2: NexRay (Secondary)
+// ============================================
+async function fetchFromNexRay(username) {
+    log(`🔍 Trying NexRay API for: ${username}`);
+    try {
+        const response = await axios.get(
+            `https://api.nexray.web.id/stalker/instagram?username=${encodeURIComponent(username)}`,
+            {
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'Accept': 'application/json'
+                },
+                timeout: 15000
+            }
+        );
+        
+        if (response.data?.status && response.data?.result) {
+            const result = response.data.result;
+            log(`✅ NexRay API success for: ${username}`);
+            
+            let postsData = [];
+            if (result.posts && result.posts.length > 0) {
+                postsData = result.posts.slice(0, 5).map((post) => ({
+                    id: post.id || 'unknown',
+                    shortcode: post.code || 'unknown',
+                    type: post.type || 'Image',
+                    isVideo: post.type === 'Video',
+                    caption: post.caption || '',
+                    likes: post.likes || 0,
+                    comments: post.comments || 0,
+                    views: post.views || null,
+                    thumbnail: post.thumbnail || post.display_url || '',
+                    video: post.video_url || null,
+                    timestamp: post.taken_at || Math.floor(Date.now() / 1000),
+                    timestampFormatted: post.taken_at ? formatTimestamp(post.taken_at) : 'Unknown'
+                }));
+            }
+            
+            return {
+                success: true,
+                source: 'nexray',
+                data: {
+                    id: result.id || username,
+                    username: result.username || username,
+                    fullName: result.full_name || username,
+                    biography: result.biography || '',
+                    followers: result.followers_count || 0,
+                    following: result.following_count || 0,
+                    posts: result.posts_count || 0,
+                    highlights: 0,
+                    verified: result.is_verified || false,
+                    private: result.is_private || false,
+                    professional: result.is_business_account || false,
+                    business: result.is_business_account || false,
+                    category: result.category_name || '',
+                    externalUrl: result.external_url || '',
+                    profilePic: result.profile_pic_url || '',
+                    postsData: postsData
+                }
+            };
+        }
+        return null;
+    } catch (error) {
+        log(`❌ NexRay API error: ${error.message}`);
+        return null;
+    }
+}
+
+// ============================================
+// API 3: Direct Instagram (Fallback)
+// ============================================
+async function fetchDirectInstagram(username) {
+    log(`🔍 Trying direct Instagram API for: ${username}`);
+    try {
+        const response = await axios.get(
+            'https://www.instagram.com/api/v1/users/web_profile_info/',
+            {
+                params: { username },
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'X-IG-App-ID': '936619743392459',
+                    'Accept': 'application/json, text/plain, */*',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'Referer': 'https://www.instagram.com/',
+                    'Origin': 'https://www.instagram.com',
+                    'Sec-Fetch-Dest': 'empty',
+                    'Sec-Fetch-Mode': 'cors',
+                    'Sec-Fetch-Site': 'same-site',
+                    'Connection': 'keep-alive'
+                },
+                timeout: 30000
+            }
+        );
+
+        if (!response.data?.data?.user) {
+            log(`❌ Direct Instagram: User not found: ${username}`);
+            return null;
+        }
+
+        const user = response.data.data.user;
+        log(`✅ Direct Instagram success for: ${username}`);
+        
+        const posts = user.edge_owner_to_timeline_media?.edges?.map(({ node }) => ({
+            id: node.id,
+            shortcode: node.shortcode,
+            type: node.__typename,
+            isVideo: node.is_video || false,
+            caption: node.edge_media_to_caption?.edges?.[0]?.node?.text || '',
+            likes: node.edge_liked_by?.count || 0,
+            comments: node.edge_media_to_comment?.count || 0,
+            views: node.video_view_count || null,
+            thumbnail: node.display_url,
+            video: node.video_url || null,
+            timestamp: node.taken_at_timestamp,
+            timestampFormatted: formatTimestamp(node.taken_at_timestamp)
+        })) || [];
+
+        return {
+            success: true,
+            source: 'direct',
+            data: {
+                id: user.id,
+                username: user.username,
+                fullName: user.full_name || user.username,
+                biography: user.biography || '',
+                followers: user.edge_followed_by?.count || 0,
+                following: user.edge_follow?.count || 0,
+                posts: user.edge_owner_to_timeline_media?.count || 0,
+                highlights: user.highlight_reel_count || 0,
+                verified: user.is_verified || false,
+                private: user.is_private || false,
+                professional: user.is_professional_account || false,
+                business: user.is_business_account || false,
+                category: user.category_name || '',
+                externalUrl: user.external_url || '',
+                profilePic: user.profile_pic_url_hd || user.profile_pic_url || '',
+                postsData: posts.slice(0, 5)
+            }
+        };
 
     } catch (error) {
-        console.error('Error:', error.message);
-        res.status(500).json({
-            success: false,
-            error: error.message,
-            username: username
-        });
-    } finally {
-        if (browser) {
-            await browser.close();
+        if (error.response?.status === 429) {
+            log(`❌ Direct Instagram: Rate limited (429)`);
+        } else if (error.response?.status === 404) {
+            log(`❌ Direct Instagram: User not found (404)`);
+        } else {
+            log(`❌ Direct Instagram error: ${error.message}`);
+        }
+        return null;
+    }
+}
+
+// ============================================
+// MAIN STALK FUNCTION
+// ============================================
+async function stalkInstagram(username) {
+    // Check cache first
+    const cacheKey = username.toLowerCase();
+    if (cache.has(cacheKey)) {
+        const cached = cache.get(cacheKey);
+        if (Date.now() - cached.timestamp < CACHE_DURATION) {
+            log(`📦 Cache hit for: ${username}`);
+            return { ...cached.data, cached: true };
+        } else {
+            cache.delete(cacheKey);
         }
     }
-});
 
-// Simple health check
-app.get('/health', (req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
+    log(`🔍 Fetching Instagram user: ${username}`);
 
-// Root endpoint with instructions
+    // Try APIs in order
+    const apis = [
+        { fn: fetchFromVreden, name: 'Vreden' },
+        { fn: fetchFromNexRay, name: 'NexRay' },
+        { fn: fetchDirectInstagram, name: 'Direct' }
+    ];
+
+    for (const api of apis) {
+        const result = await api.fn(username);
+        if (result && result.success) {
+            // Cache the result
+            cache.set(cacheKey, {
+                timestamp: Date.now(),
+                data: result
+            });
+            log(`✅ Success via ${api.name} API for: ${username}`);
+            return result;
+        }
+    }
+
+    log(`❌ All APIs failed for: ${username}`);
+    return {
+        success: false,
+        error: 'All APIs failed. Please try again later.'
+    };
+}
+
+// ============================================
+// API ENDPOINTS
+// ============================================
+
+// Health check
 app.get('/', (req, res) => {
-    res.send(`
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Instagram DP Viewer API</title>
-            <style>
-                body {
-                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                    max-width: 800px;
-                    margin: 50px auto;
-                    padding: 20px;
-                    line-height: 1.6;
-                    color: #333;
-                }
-                h1 { color: #E4405F; }
-                .endpoint {
-                    background: #f5f5f5;
-                    padding: 15px;
-                    border-radius: 8px;
-                    margin: 20px 0;
-                }
-                code {
-                    background: #e8e8e8;
-                    padding: 2px 6px;
-                    border-radius: 4px;
-                    font-family: 'Courier New', monospace;
-                }
-                .example {
-                    background: #fff3f5;
-                    padding: 15px;
-                    border-radius: 8px;
-                    border-left: 4px solid #E4405F;
-                }
-                .footer {
-                    margin-top: 40px;
-                    color: #888;
-                    font-size: 14px;
-                }
-            </style>
-        </head>
-        <body>
-            <h1>📸 Instagram DP Viewer API</h1>
-            <p>Fetch Instagram profile pictures using Playwright automation.</p>
-            
-            <div class="endpoint">
-                <h3>📌 Endpoint</h3>
-                <code>GET /api/dp/:username</code>
-            </div>
-            
-            <div class="example">
-                <h3>🔍 Example</h3>
-                <p>Get profile picture for username <strong>devzikky</strong>:</p>
-                <code>https://your-app.onrender.com/api/dp/devzikky</code>
-                <br><br>
-                <a href="/api/dp/devzikky" target="_blank">▶ Try it now</a>
-            </div>
-            
-            <div class="endpoint">
-                <h3>📊 Response Format</h3>
-                <pre style="background: #f8f8f8; padding: 15px; border-radius: 4px; overflow-x: auto;">
-{
-  "success": true,
-  "username": "devzikky",
-  "profile_picture": {
-    "url": "https://...",
-    "source": "indown.io"
-  },
-  "images": {
-    "found": [...],
-    "raw": [...]
-  }
-}</pre>
-            </div>
-            
-            <div class="footer">
-                Powered by Playwright + Chromium | Deployed on Render
-            </div>
-        </body>
-        </html>
-    `);
+    res.json({
+        status: 'ok',
+        message: 'Instagram Stalk API is running',
+        endpoints: [
+            '/stalk/:username',
+            '/stalk/:username?format=whatsapp'
+        ]
+    });
 });
 
-// Start server
-app.listen(PORT, () => {
-    console.log(`🚀 Server running on port ${PORT}`);
-    console.log(`📸 Instagram DP Viewer API ready`);
-    console.log(`🌐 http://localhost:${PORT}`);
+// Stalk endpoint
+app.get('/stalk/:username', async (req, res) => {
+    const { username } = req.params;
+    const { format } = req.query;
+    
+    if (!username) {
+        return res.status(400).json({
+            success: false,
+            error: 'Username is required'
+        });
+    }
+
+    log(`📥 Request for: ${username} (format: ${format || 'json'})`);
+
+    const result = await stalkInstagram(username);
+
+    if (!result.success) {
+        return res.status(404).json(result);
+    }
+
+    // Return raw data
+    if (format === 'raw' || format === 'json') {
+        return res.json(result);
+    }
+
+    // Return formatted WhatsApp message
+    if (format === 'whatsapp') {
+        const data = result.data;
+        const message = formatWhatsAppResponse(data);
+        return res.json({
+            success: true,
+            source: result.source,
+            cached: result.cached || false,
+            formatted: message
+        });
+    }
+
+    // Default: return full data
+    return res.json(result);
 });
+
+// ============================================
+// WHATSAPP FORMATTING
+// ============================================
+function formatWhatsAppResponse(data) {
+    const username = data.username;
+    const fullName = data.fullName || username;
+    const bio = data.biography || 'No bio';
+    const followers = formatNumber(data.followers);
+    const following = formatNumber(data.following);
+    const posts = formatNumber(data.posts);
+    
+    const verified = data.verified ? '✅ Yes' : '❌ No';
+    const privateAccount = data.private ? '🔒 Yes' : '🔓 No';
+    const business = data.business ? '✅' : '❌';
+
+    const bioDisplay = bio.length > 150 ? bio.substring(0, 150) + '...' : bio;
+
+    let message = `╭━━━༺ *📸 INSTAGRAM USER INFO* ༻━━━╮\n`;
+    message += `┃\n`;
+    message += `┃ 👤 *Username:* @${username}\n`;
+    message += `┃ 📛 *Full Name:* ${fullName}\n`;
+    message += `┃\n`;
+    message += `┃ 📝 *Bio:*\n`;
+    message += `┃ ${bioDisplay}\n`;
+
+    if (data.externalUrl) {
+        message += `┃\n┃ 🌐 *Website:*\n┃ ${data.externalUrl}\n`;
+    }
+
+    if (data.category) {
+        message += `┃\n┃ 🏷️ *Category:* ${data.category}\n`;
+    }
+
+    message += `┃\n`;
+    message += `┃ 📊 *Stats:*\n`;
+    message += `┃    👥 *Followers:* ${followers}\n`;
+    message += `┃    🔄 *Following:* ${following}\n`;
+    message += `┃    📸 *Posts:* ${posts}\n`;
+    message += `┃\n`;
+    message += `┃ 🔰 *Verified:* ${verified}\n`;
+    message += `┃ 🔒 *Private:* ${privateAccount}\n`;
+    message += `┃ 💼 *Business:* ${business}\n`;
+    message += `┃\n`;
+
+    if (data.postsData && data.postsData.length > 0) {
+        message += `┃ 📷 *Latest Posts:*\n`;
+        data.postsData.slice(0, 3).forEach((post, i) => {
+            const type = post.isVideo ? '🎥' : '🖼️';
+            const likes = formatNumber(post.likes);
+            const comments = formatNumber(post.comments);
+            const time = post.timestampFormatted || 'Unknown';
+            message += `┃    ${i + 1}. ${type} ${post.shortcode}\n`;
+            message += `┃       ❤️ ${likes} | 💬 ${comments} | ⏱️ ${time}\n`;
+        });
+        message += `┃\n`;
+    }
+
+    message += `┃ 🔗 *Profile:*\n`;
+    message += `┃ https://instagram.com/${username}\n`;
+    message += `╰━━━━━━━━━━━━━━━━━━━━━━━╯\n\n`;
+    message += `> *_Powered by ᴅᴇᴠ ᴢɪᴋᴋʏ ᴍᴅ_*`;
+
+    return message;
+}
+
+// ============================================
+// START SERVER
+// ============================================
+app.listen(PORT, () => {
+    log(`🚀 Instagram Stalk API running on port ${PORT}`);
+    log(`📍 Health check: http://localhost:${PORT}/`);
+    log(`📍 Example: http://localhost:${PORT}/stalk/devzikky`);
+});
+
+// Handle process termination
+process.on('SIGTERM', () => {
+    log('🛑 Received SIGTERM, shutting down...');
+    process.exit(0);
+});
+
+process.on('SIGINT', () => {
+    log('🛑 Received SIGINT, shutting down...');
+    process.exit(0);
+});
+
 
